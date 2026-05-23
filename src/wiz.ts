@@ -20,12 +20,15 @@ export default class HomebridgeWizLan {
   public readonly accessories: PlatformAccessory[] = [];
   public readonly initializedAccessories: {[uuid: string]: WizAccessory<any>} = {};
   public readonly socket: Socket;
+  public isShuttingDown = false;
+  private refreshTimer?: NodeJS.Timeout;
 
   constructor(
     public readonly log: Logger,
     public readonly config: Config,
     public readonly api: API
   ) {
+    this.api.on("shutdown", () => this.shutdown());
     this.socket = createSocket(this);
 
     // When this event is fired it means Homebridge has restored all cached accessories from disk.
@@ -42,6 +45,14 @@ export default class HomebridgeWizLan {
     });
 
     this.initRefreshInterval();
+  }
+
+  private shutdown() {
+    this.isShuttingDown = true;
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
   }
 
   initAccessory(platformAccessory: PlatformAccessory) {
@@ -92,7 +103,10 @@ export default class HomebridgeWizLan {
       }
     } else {
       this.log.info(`[Refresh] Setting up ping for every ${interval} seconds`);
-      setInterval(() => {
+      this.refreshTimer = setInterval(() => {
+        if (this.isShuttingDown) {
+          return;
+        }
         const accessories = Object.values(this.initializedAccessories);
         this.log.debug(`[Refresh] Pinging ${accessories.length} accessories...`);
         for (const accessory of accessories) {

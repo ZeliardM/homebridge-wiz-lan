@@ -19,6 +19,48 @@ function strIp() {
 
 const BROADCAST_PORT = 38899;
 
+function isSocketNotRunningError(error: unknown) {
+  return error instanceof Error &&
+    ((error as NodeJS.ErrnoException).code === "ERR_SOCKET_DGRAM_NOT_RUNNING" ||
+      error.message === "Not running");
+}
+
+function sendSocketMessage(
+  wiz: HomebridgeWizLan,
+  message: string,
+  port: number,
+  address: string,
+  onError?: (error: Error) => void,
+) {
+  const log = makeLogger(wiz, "Socket");
+  if (wiz.isShuttingDown) {
+    log.debug(`Skipping UDP send to ${address}:${port} because Homebridge is shutting down`);
+    onError?.(new Error("Homebridge is shutting down"));
+    return;
+  }
+
+  try {
+    wiz.socket.send(message, port, address, (error: Error | null) => {
+      if (error !== null) {
+        onError?.(error);
+      }
+    });
+  } catch (error) {
+    if (!isSocketNotRunningError(error)) {
+      throw error;
+    }
+
+    const err = error instanceof Error ? error : new Error(String(error));
+    const message = `Skipping UDP send to ${address}:${port} because the socket is not running`;
+    if (wiz.isShuttingDown) {
+      log.debug(message);
+    } else {
+      log.warn(message);
+    }
+    onError?.(err);
+  }
+}
+
 function getNetworkConfig({ config }: HomebridgeWizLan) {
   return {
     ADDRESS: config.address ?? strIp(),
@@ -68,12 +110,13 @@ function getPilotInternal<T>(
     getPilotQueue[device.mac] = [callback];
   }
   wiz.log.debug(`[getPilot] Sending getPilot to ${device.mac}`);
-  wiz.socket.send(
+  sendSocketMessage(
+    wiz,
     `{"method":"getPilot","params":{}}`,
     BROADCAST_PORT,
     device.ip,
-    (error: Error | null) => {
-      if (error !== null && device.mac in getPilotQueue) {
+    (error) => {
+      if (device.mac in getPilotQueue) {
         wiz.log.debug(
           `[Socket] Failed to send getPilot response to ${
             device.mac
@@ -119,15 +162,15 @@ export function setPilot(
     setPilotQueue[device.ip] = [callback];
   }
   wiz.log.debug(`[SetPilot][${device.ip}:${BROADCAST_PORT}] ${msg}`);
-  wiz.socket.send(msg, BROADCAST_PORT, device.ip, (error: Error | null) => {
-    if (error !== null && device.mac in setPilotQueue) {
+  sendSocketMessage(wiz, msg, BROADCAST_PORT, device.ip, (error) => {
+    if (device.ip in setPilotQueue) {
       wiz.log.debug(
         `[Socket] Failed to send setPilot response to ${
           device.mac
         }: ${error.toString()}`
       );
-      const callbacks = setPilotQueue[device.mac];
-      delete setPilotQueue[device.mac];
+      const callbacks = setPilotQueue[device.ip];
+      delete setPilotQueue[device.ip];
       callbacks.map((f) => f(error));
     }
   });
@@ -151,7 +194,14 @@ export function createSocket(wiz: HomebridgeWizLan) {
 
   wiz.api.on("shutdown", () => {
     log.debug("Shutting down socket");
-    socket.close();
+    try {
+      socket.close();
+    } catch (error) {
+      if (!isSocketNotRunningError(error)) {
+        throw error;
+      }
+      log.debug("Socket was already stopped");
+    }
   });
 
   return socket;
@@ -199,7 +249,8 @@ export function registerDiscoveryHandler(
         recordHit(mac);
         log.debug(`[${ip}@${mac}] Sending config request (getSystemConfig)`);
         // Send system config request
-        wiz.socket.send(
+        sendSocketMessage(
+          wiz,
           `{"method":"getSystemConfig","params":{}}`,
           BROADCAST_PORT,
           ip
@@ -247,7 +298,8 @@ export function sendDiscoveryBroadcast(service: HomebridgeWizLan) {
   log.debug(`Sending discovery UDP broadcast to ${BROADCAST}:${BROADCAST_PORT}`);
 
   // Send generic discovery message
-  service.socket.send(
+  sendSocketMessage(
+    service,
     `{"method":"registration","params":{"phoneMac":"${MAC}","register":false,"phoneIp":"${ADDRESS}"}}`,
     BROADCAST_PORT,
     BROADCAST
@@ -258,7 +310,8 @@ export function sendDiscoveryBroadcast(service: HomebridgeWizLan) {
     for (const device of service.config.devices) {
       if (device.host) {
         log.debug(`Sending discovery UDP broadcast to ${device.host}:${BROADCAST_PORT}`);
-        service.socket.send(
+        sendSocketMessage(
+          service,
           `{"method":"registration","params":{"phoneMac":"${MAC}","register":false,"phoneIp":"${ADDRESS}"}}`,
           BROADCAST_PORT,
           device.host
